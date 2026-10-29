@@ -28,7 +28,13 @@ void main() {
     await openCart(tester);
 
     // --- Действия ---
-    await tester.tap(find.byKey(AppKeys.checkoutButton));
+    final checkoutButton = find.byKey(AppKeys.checkoutButton).hitTestable();
+    await waitFor(
+      tester,
+      checkoutButton,
+      message: 'Кнопка оформления недоступна для нажатия',
+    );
+    await tester.tap(checkoutButton);
     await tester.pump();
 
     // Ожидание экрана успеха (HTTP POST /orders).

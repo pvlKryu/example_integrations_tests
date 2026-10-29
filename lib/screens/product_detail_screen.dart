@@ -54,7 +54,7 @@ class ProductDetailScreen extends StatelessWidget {
                     SnackBar(
                       key: AppKeys.addConfirmation,
                       content: Text('${product.name} добавлен в корзину'),
-                      duration: const Duration(seconds: 2),
+                      duration: const Duration(seconds: 1),
                     ),
                   );
                 },

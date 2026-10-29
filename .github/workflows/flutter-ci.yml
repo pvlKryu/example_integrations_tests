@@ -1,0 +1,292 @@
+name: Flutter CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: flutter-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.38.5"
+  JAVA_VERSION: "17"
+  ANDROID_API_LEVEL: "34"
+  ANDROID_ARCH: "x86_64"
+  ANDROID_TARGET: "default"
+  # Адрес хост-машины со стабом с Android Emulator (см. README).
+  API_BASE_URL_ANDROID: "http://10.0.2.2:8080"
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:"
+          pub-cache-key: "flutter-pub-:os:-:channel:-:version:-:arch:-:hash:"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Install junitreport
+        run: dart pub global activate junitreport
+
+      - name: Run unit and widget tests with coverage
+        id: unit_tests
+        run: |
+          mkdir -p test-results
+          set +e
+          flutter test test/ \
+            --coverage \
+            --file-reporter json:test-results/unit-machine.jsonl
+          code=$?
+          set -e
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit "${code}"
+
+      - name: Convert unit results to JUnit
+        if: always() && hashFiles('test-results/unit-machine.jsonl') != ''
+        run: |
+          dart pub global run junitreport:tojunit \
+            --base "${PWD}/" \
+            --input test-results/unit-machine.jsonl \
+            --output test-results/junit-unit.xml
+
+      - name: Upload coverage
+        if: always() && hashFiles('coverage/lcov.info') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-lcov
+          path: coverage/lcov.info
+          if-no-files-found: warn
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: unit-test-results
+          path: test-results/
+          if-no-files-found: warn
+
+  integration:
+    name: integration
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:"
+          pub-cache-key: "flutter-pub-:os:-:channel:-:version:-:arch:-:hash:"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Install junitreport
+        run: dart pub global activate junitreport
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache AVD
+        uses: actions/cache@v5
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ env.ANDROID_API_LEVEL }}-${{ env.ANDROID_TARGET }}-${{ env.ANDROID_ARCH }}
+
+      - name: Create AVD and generate snapshot
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: ${{ env.ANDROID_TARGET }}
+          arch: ${{ env.ANDROID_ARCH }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: Run integration tests on emulator
+        id: integration_tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: ${{ env.ANDROID_TARGET }}
+          arch: ${{ env.ANDROID_ARCH }}
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -euo pipefail
+            mkdir -p test-results
+
+            STUB_PID=""
+            cleanup() {
+              if [[ -n "${STUB_PID}" ]] && kill -0 "${STUB_PID}" 2>/dev/null; then
+                kill "${STUB_PID}" || true
+                wait "${STUB_PID}" 2>/dev/null || true
+              fi
+            }
+            trap cleanup EXIT
+
+            DART_BIN="$(dirname "$(which flutter)")/cache/dart-sdk/bin/dart"
+            "${DART_BIN}" run tool/stub_server.dart > test-results/stub-server.log 2>&1 &
+            STUB_PID=$!
+
+            echo "Waiting for HTTP stub..."
+            for i in $(seq 1 30); do
+              if curl -sf http://127.0.0.1:8080/health > test-results/stub-health.json; then
+                echo "Stub is healthy"
+                cat test-results/stub-health.json
+                break
+              fi
+              if [[ "${i}" -eq 30 ]]; then
+                echo "Stub failed to become healthy"
+                cat test-results/stub-server.log || true
+                exit 1
+              fi
+              sleep 1
+            done
+
+            echo "Waiting for Android device..."
+            adb wait-for-device
+            for i in $(seq 1 60); do
+              boot="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+              if [[ "${boot}" == "1" ]]; then
+                break
+              fi
+              if [[ "${i}" -eq 60 ]]; then
+                echo "Emulator did not finish booting"
+                exit 1
+              fi
+              sleep 2
+            done
+
+            DEVICE_ID="$(adb devices | awk '/\temulator/{print $1; exit}')"
+            if [[ -z "${DEVICE_ID}" ]]; then
+              echo "No emulator device found"
+              adb devices -l
+              exit 1
+            fi
+            echo "Using device: ${DEVICE_ID}"
+            flutter devices
+
+            # Только устойчивые сценарии CI:
+            # Б. добавление в корзину, Д. ошибка API с повтором.
+            # delay_test (flaky-demo) намеренно не включаем.
+            set +e
+            flutter test \
+              integration_test/cart_test.dart \
+              integration_test/error_test.dart \
+              -d "${DEVICE_ID}" \
+              --dart-define=API_BASE_URL="${API_BASE_URL_ANDROID}" \
+              --name "Добавление товара в корзину|Ошибка загрузки каталога" \
+              --file-reporter json:test-results/integration-machine.jsonl
+            code=$?
+            set -e
+
+            echo "${code}" > test-results/integration-exit-code.txt
+            exit "${code}"
+
+      - name: Convert integration results to JUnit
+        if: always() && hashFiles('test-results/integration-machine.jsonl') != ''
+        run: |
+          dart pub global run junitreport:tojunit \
+            --base "${PWD}/" \
+            --input test-results/integration-machine.jsonl \
+            --output test-results/junit-integration.xml
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: integration-test-results
+          path: test-results/
+          if-no-files-found: warn
+
+  build:
+    name: build
+    needs:
+      - quality
+      - integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:"
+          pub-cache-key: "flutter-pub-:os:-:channel:-:version:-:arch:-:hash:"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error

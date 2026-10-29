@@ -6,6 +6,7 @@ import '../config.dart';
 import '../models/order.dart';
 import '../models/product.dart';
 import 'api_exception.dart';
+import 'logging_client.dart';
 
 /// HTTP-клиент к учебному стабу.
 /// Настоящие сетевые запросы — это то, что проверяют интеграционные тесты.
@@ -14,7 +15,7 @@ class ApiClient {
     String? baseUrl,
     http.Client? httpClient,
   })  : baseUrl = baseUrl ?? AppConfig.apiBaseUrl,
-        _httpClient = httpClient ?? http.Client(),
+        _httpClient = httpClient ?? LoggingClient(),
         _ownsClient = httpClient == null;
 
   final String baseUrl;

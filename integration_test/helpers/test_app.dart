@@ -88,6 +88,13 @@ Future<void> addCurrentProductToCart(
     find.byKey(AppKeys.addConfirmation),
     message: 'Подтверждение добавления в корзину не появилось',
   );
+  // SnackBar внизу перекрывает кнопки корзины/оформления — ждём исчезновения.
+  await waitUntilGone(
+    tester,
+    find.byKey(AppKeys.addConfirmation),
+    timeout: const Duration(seconds: 5),
+    message: 'SnackBar подтверждения не исчез',
+  );
 }
 
 /// Возврат с карточки в каталог.

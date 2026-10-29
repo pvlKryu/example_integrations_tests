@@ -87,6 +87,10 @@ Future<void> main(List<String> args) async {
 
     try {
       await _handle(request);
+      stdout.writeln(
+        '${request.method} ${request.uri.path} → ${request.response.statusCode}'
+        ' [scenario=$scenario]',
+      );
     } catch (e, st) {
       stderr.writeln('Error: $e\n$st');
       request.response.statusCode = HttpStatus.internalServerError;

@@ -51,16 +51,14 @@ class _CartScreenState extends State<CartScreen> {
       // После успешного оформления корзина очищается.
       widget.cartState.clear();
       if (!mounted) return;
-      final navigator = Navigator.of(context);
-      // Сначала закрываем корзину, затем показываем результат поверх каталога.
-      navigator.pop();
-      await navigator.push(
+      await Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(
           builder: (_) => OrderSuccessScreen(
             orderNumber: order.orderNumber,
             totalKopecks: order.totalKopecks,
           ),
         ),
+        (route) => route.isFirst,
       );
     } on ApiException catch (e) {
       if (!mounted) return;
