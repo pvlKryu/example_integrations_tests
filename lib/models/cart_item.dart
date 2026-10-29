@@ -1,6 +1,7 @@
 import 'product.dart';
 
-class CartItem {
+/// Модель элемента корзины.
+final class CartItem {
   const CartItem({
     required this.product,
     required this.quantity,
