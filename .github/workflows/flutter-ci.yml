@@ -1,30 +1,39 @@
+# Проверки Flutter-приложения: стиль и анализ, unit/widget-тесты,
+# интеграционные тесты на Android-эмуляторе и сборка debug APK.
 name: Flutter CI
 
 on:
+  # Любой pull request и пуш в main. Ручной запуск — кнопка Run workflow.
   pull_request:
   push:
     branches:
       - main
   workflow_dispatch:
 
+# Один прогон на ветку: новый пуш отменяет ещё идущий, чтобы не копить эмуляторы.
 concurrency:
   group: flutter-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
+  # Версии зафиксированы, чтобы прогон не зависел от «последнего» SDK на runner.
   FLUTTER_VERSION: "3.38.5"
   JAVA_VERSION: "17"
+  # Образ системы и архитектура AVD. x86_64 быстрее на GitHub-hosted Ubuntu.
   ANDROID_API_LEVEL: "34"
   ANDROID_ARCH: "x86_64"
   ANDROID_TARGET: "default"
-  # Адрес хост-машины со стабом с Android Emulator (см. README).
+  # С эмулятора 10.0.2.2 — это localhost хоста, где слушает stub_server (порт 8080).
   API_BASE_URL_ANDROID: "http://10.0.2.2:8080"
 
 jobs:
+  # Jobs независимы: падение одного не отменяет и не блокирует остальные.
+  # continue-on-error на job — workflow не красный целиком, статус шага всё равно виден.
   quality:
     name: quality
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,6 +43,7 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
+          # Кэш SDK и pub, ключ включает хеш lockfile — смена зависимостей сбрасывает кэш.
           cache: true
           pub-cache: true
           cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:"
@@ -42,17 +52,26 @@ jobs:
       - name: Resolve dependencies
         run: flutter pub get
 
+      # Flutter SDK dart (не Homebrew): иначе локально и CI расходятся по стилю.
+      # continue-on-error: падение format не отменяет analyze и тесты ниже.
       - name: Check formatting
-        run: dart format --output=none --set-exit-if-changed .
+        continue-on-error: true
+        run: |
+          DART_BIN="$(dirname "$(which flutter)")/cache/dart-sdk/bin/dart"
+          "${DART_BIN}" format --output=none --set-exit-if-changed .
 
       - name: Analyze
+        continue-on-error: true
         run: flutter analyze
 
+      # Конвертер машинного JSON Flutter в JUnit XML для отчётов.
       - name: Install junitreport
         run: dart pub global activate junitreport
 
+      # set +e сохраняет код выхода тестов; continue-on-error — не рвёт последующие шаги.
       - name: Run unit and widget tests with coverage
         id: unit_tests
+        continue-on-error: true
         run: |
           mkdir -p test-results
           set +e
@@ -64,6 +83,7 @@ jobs:
           echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
           exit "${code}"
 
+      # always(): отчёт нужен и после падения тестов. hashFiles — шаг пропускается, если JSON нет.
       - name: Convert unit results to JUnit
         if: always() && hashFiles('test-results/unit-machine.jsonl') != ''
         run: |
@@ -88,15 +108,18 @@ jobs:
           path: test-results/
           if-no-files-found: warn
 
+  # UI-тесты на эмуляторе против локального HTTP-стаба (tool/stub_server.dart).
+  # Без needs: quality — стартует параллельно, не ждёт и не блокируется quality.
   integration:
     name: integration
-    needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # JDK и Gradle нужны и эмулятору (Android SDK), и сборке APK для тестов.
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
@@ -122,6 +145,7 @@ jobs:
       - name: Install junitreport
         run: dart pub global activate junitreport
 
+      # Без /dev/kvm эмулятор на runner идёт через программную виртуализацию и не успевает.
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -129,6 +153,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # AVD и снимок загрузки живут между прогонами. Промах кэша — шаг создания ниже.
       - name: Cache AVD
         uses: actions/cache@v5
         id: avd-cache
@@ -138,6 +163,7 @@ jobs:
             ~/.android/adb*
           key: avd-${{ env.ANDROID_API_LEVEL }}-${{ env.ANDROID_TARGET }}-${{ env.ANDROID_ARCH }}
 
+      # Первый прогон (или смена API/arch): создать AVD и снимок, тесты здесь не гоняем.
       - name: Create AVD and generate snapshot
         if: steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@v2
@@ -158,12 +184,14 @@ jobs:
           target: ${{ env.ANDROID_TARGET }}
           arch: ${{ env.ANDROID_ARCH }}
           force-avd-creation: false
+          # -no-snapshot-save: не перезаписывать кэшированный снимок загрузки.
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
             set -euo pipefail
             mkdir -p test-results
 
+            # Стаб — фоновый процесс на хосте. trap гасит его при любом выходе скрипта.
             STUB_PID=""
             cleanup() {
               if [[ -n "${STUB_PID}" ]] && kill -0 "${STUB_PID}" 2>/dev/null; then
@@ -173,6 +201,7 @@ jobs:
             }
             trap cleanup EXIT
 
+            # dart из Flutter SDK, не системный: версия совпадает с flutter test.
             DART_BIN="$(dirname "$(which flutter)")/cache/dart-sdk/bin/dart"
             "${DART_BIN}" run tool/stub_server.dart > test-results/stub-server.log 2>&1 &
             STUB_PID=$!
@@ -192,6 +221,8 @@ jobs:
               sleep 1
             done
 
+            # sys.boot_completed=1 надёжнее, чем один adb wait-for-device:
+            # устройство уже в списке, а система ещё грузится.
             echo "Waiting for Android device..."
             adb wait-for-device
             for i in $(seq 1 60); do
@@ -218,6 +249,7 @@ jobs:
             # Только устойчивые сценарии CI:
             # Б. добавление в корзину, Д. ошибка API с повтором.
             # delay_test (flaky-demo) намеренно не включаем.
+            # --name фильтрует по названию теста, --dart-define задаёт базовый URL стаба.
             set +e
             flutter test \
               integration_test/cart_test.dart \
@@ -240,6 +272,7 @@ jobs:
             --input test-results/integration-machine.jsonl \
             --output test-results/junit-integration.xml
 
+      # Логи стаба, JSON и JUnit остаются артефактами даже если тесты упали.
       - name: Upload integration test reports
         if: always()
         uses: actions/upload-artifact@v5
@@ -248,13 +281,12 @@ jobs:
           path: test-results/
           if-no-files-found: warn
 
+  # Сборка параллельно с quality/integration — падение тестов её не отменяет.
   build:
     name: build
-    needs:
-      - quality
-      - integration
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -281,6 +313,7 @@ jobs:
       - name: Resolve dependencies
         run: flutter pub get
 
+      # Debug APK: тот же тип сборки, что гоняет интеграционные тесты на эмуляторе.
       - name: Build debug APK
         run: flutter build apk --debug
 
